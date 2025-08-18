@@ -9,6 +9,7 @@
 3. 统计上一自然月每个项目在不同 manifest 分支上的访问次数，并记录最近一次访问时间。
 4. 将结果保存到 results/YYYY‑MM_summary.csv（UTF‑8 编码）。
 """
+# -*- coding: utf-8 -*-
 
 import os
 from datetime import datetime, timedelta
@@ -101,6 +102,34 @@ def main():
     output_path = os.path.join(results_dir, output_name)
     summary.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"Saved summary to {output_path}")
+     # 假设 summary 为结果 DataFrame
+    summary['最近一次访问时间'] = summary['最近一次访问时间'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    # 输出 CSV
+    csv_path = os.path.join(results_dir, f'{month_str}_summary.csv')
+    summary.to_csv(csv_path, index=False, encoding='utf-8-sig')
+
+    # 输出 Excel 并自动调整列宽
+    from openpyxl import Workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Summary'
+
+    for row in dataframe_to_rows(summary, index=False, header=True):
+        ws.append(row)
+
+    # 根据内容调整每列宽度，使表格美观
+    for col_idx, column_cells in enumerate(ws.columns, 1):
+        max_length = max(len(str(cell.value)) if cell.value else 0 for cell in column_cells)
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = max_length + 2
+
+    xlsx_path = os.path.join(results_dir, f'{month_str}_summary.xlsx')
+    wb.save(xlsx_path)
+    print(f'Saved Excel to {xlsx_path}')
 
 if __name__ == "__main__":
     main()
