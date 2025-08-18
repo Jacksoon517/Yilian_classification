@@ -1,0 +1,49 @@
+name: Yilian classification monthly stats
+
+on:
+  # 每月 1 日 00:00（UTC）自动触发，也可以通过 workflow_dispatch 手动触发
+  schedule:
+    - cron: "0 0 1 * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 检出仓库内容
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+
+      # 安装 Python 3（版本可自定义）
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      # 安装依赖库
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas openpyxl
+
+      # 执行数据统计脚本
+      - name: Run classification script
+        run: python scripts/process_yilian.py
+
+      # 将 results 文件夹中新增/修改的文件提交
+      - name: Commit results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add results/*
+          # 如果有变更则提交
+          git diff --cached --quiet || git commit -m "Update classification summary $(date '+%Y-%m-%d')"
+
+      # 推送改动（利用 GITHUB_TOKEN 认证）
+      - name: Push changes
+        uses: ad-m/github-push-action@v0.6.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
