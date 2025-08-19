@@ -1,0 +1,135 @@
+# -*- coding: utf-8 -*-
+"""
+用“自定义机器人 Webhook”推送月报卡片：
+- 从 results/ 中找到最新 *summary*.csv
+- 复制到 monthly/YYYY-MM.csv 并已由上一步提交
+- 发送交互卡片（摘要 + 打开CSV按钮 + 打开多维表格按钮）
+
+需要环境变量：
+- FEISHU_WEBHOOK_URL
+- FEISHU_WEBHOOK_SECRET（可选；若配置了机器人安全秘钥则必填）
+- CSV_URL （GitHub Actions 上一步生成）
+- FEISHU_BITABLE_URL（可选）
+- MONTH（YYYY-MM；Actions 上一步生成）
+"""
+import os, time, hmac, base64, hashlib, json, glob, pathlib
+import pandas as pd
+from dateutil import parser as dtparser
+import requests
+
+WEBHOOK = os.environ.get("FEISHU_WEBHOOK_URL")
+SECRET  = os.environ.get("FEISHU_WEBHOOK_SECRET")
+BITABLE_URL = os.environ.get("FEISHU_BITABLE_URL", "")
+CSV_URL = os.environ.get("CSV_URL", "")
+MONTH   = os.environ.get("MONTH", "")
+
+def latest_csv_path():
+    cands = glob.glob("results/**/*summary*.csv", recursive=True) + glob.glob("results/*summary*.csv")
+    if not cands:
+        raise FileNotFoundError("未找到 results/*summary*.csv")
+    return max(cands, key=lambda p: pathlib.Path(p).stat().st_mtime)
+
+def infer_month_from_csv(csv_path):
+    # 若未传 MONTH，尝试从文件名或发布时间推断
+    from datetime import datetime
+    import re
+    m = re.search(r"(20\d{2})[-_](\d{2})", pathlib.Path(csv_path).name)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    try:
+        df = pd.read_csv(csv_path)
+        if "发布时间" in df.columns and len(df) > 0:
+            ts = dtparser.parse(str(df["发布时间"].iloc[0]))
+            return ts.strftime("%Y-%m")
+    except Exception:
+        pass
+    return datetime.utcnow().strftime("%Y-%m")
+
+def build_card(df: pd.DataFrame, month: str):
+    total = len(df)
+    # 分类统计（若有“分类”列）
+    cat_text = "无"
+    if "分类" in df.columns:
+        counts = df["分类"].fillna("未分类").value_counts().head(5)
+        cat_text = "，".join([f"{k}:{v}" for k, v in counts.items()])
+
+    # Top 5（按发布时间或就取前几条）
+    top_rows = []
+    if "发布时间" in df.columns:
+        try:
+            df2 = df.copy()
+            df2["__t"] = pd.to_datetime(df2["发布时间"], errors="coerce")
+            df2 = df2.sort_values("__t", ascending=False)
+            top_rows = df2.head(5).to_dict("records")
+        except Exception:
+            top_rows = df.head(5).to_dict("records")
+    else:
+        top_rows = df.head(5).to_dict("records")
+
+    md_lines = []
+    for i, r in enumerate(top_rows, 1):
+        title = str(r.get("标题", f"Item {i}"))[:120]
+        link  = str(r.get("链接", ""))
+        if link and link.startswith("http"):
+            md_lines.append(f"{i}. [{title}]({link})")
+        else:
+            md_lines.append(f"{i}. {title}")
+    md = "\n".join(md_lines) if md_lines else "（无数据）"
+
+    actions = []
+    if CSV_URL:
+        actions.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "打开CSV"},
+            "type": "primary",
+            "url": CSV_URL
+        })
+    if BITABLE_URL:
+        actions.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "打开多维表格"},
+            "url": BITABLE_URL
+        })
+
+    card = {
+      "config": {"wide_screen_mode": True, "enable_forward": True},
+      "header": {"template": "blue",
+                 "title": {"tag": "plain_text", "content": f"Yilian 月报 · {month}"}},
+      "elements": [
+        {"tag": "div",
+         "fields": [
+            {"is_short": True, "text": {"tag": "lark_md", "content": f"**本月条数**\n{total}"}},
+            {"is_short": True, "text": {"tag": "lark_md", "content": f"**分类Top**\n{cat_text}"}}
+         ]},
+        {"tag": "div", "text": {"tag": "lark_md", "content": f"**Top 5**\n{md}"}},
+      ] + ([{"tag": "action", "actions": actions}] if actions else [])
+    }
+    return card
+
+def sign_headers(secret: str):
+    ts = str(int(time.time()))
+    string_to_sign = f"{ts}\n{secret}"
+    h = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    sign = base64.b64encode(h).decode("utf-8")
+    return ts, sign
+
+def post_card(card: dict):
+    body = {"msg_type": "interactive", "card": card}
+    if SECRET:
+        ts, s = sign_headers(SECRET)
+        body.update({"timestamp": ts, "sign": s})
+    r = requests.post(WEBHOOK, json=body, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+def main():
+    assert WEBHOOK, "缺少 FEISHU_WEBHOOK_URL"
+    csv_path = latest_csv_path()
+    df = pd.read_csv(csv_path)
+    month = MONTH or infer_month_from_csv(csv_path)
+    card = build_card(df, month)
+    resp = post_card(card)
+    print("Webhook response:", resp)
+
+if __name__ == "__main__":
+    main()
