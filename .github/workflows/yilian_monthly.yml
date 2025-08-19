@@ -1,0 +1,34 @@
+name: yilian-monthly
+
+on:
+  schedule:
+    - cron: '0 2 1 * *'    # 每月1日 02:00 UTC（北京 10:00）
+  workflow_dispatch: {}
+
+permissions:
+  contents: write          # 允许提交 monthly/YYYY-MM.csv
+
+jobs:
+  monthly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: |
+          pip install -U pandas requests python-dateutil openpyxl
+
+      - name: Run monthly pipeline (summary + commit + webhook)
+        env:
+          FEISHU_WEBHOOK_URL:    ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }} # 若未启用签名可不设
+          FEISHU_BITABLE_URL:    ${{ secrets.FEISHU_BITABLE_URL }}    # 可选，按钮直达表格
+          GITHUB_TOKEN:          ${{ secrets.GITHUB_TOKEN }}          # Actions 自动注入，也可不显式传
+        run: |
+          python scripts/yilian_monthly_webhook.py
