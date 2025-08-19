@@ -27,7 +27,6 @@ jobs:
       - name: Run monthly pipeline (summary + commit + webhook)
         env:
           FEISHU_WEBHOOK_URL:    ${{ secrets.FEISHU_WEBHOOK_URL }}
-          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }} # 若未启用签名可不设
           FEISHU_BITABLE_URL:    ${{ secrets.FEISHU_BITABLE_URL }}    # 可选，按钮直达表格
           GITHUB_TOKEN:          ${{ secrets.GITHUB_TOKEN }}          # Actions 自动注入，也可不显式传
         run: |
