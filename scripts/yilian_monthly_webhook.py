@@ -1,276 +1,386 @@
 # -*- coding: utf-8 -*-
 """
-Yilian 月报：一体化脚本
-- 扫描仓库 CSV（排除 results/），兼容两种列头：{"项目名","基于哪条manifest分支","申请时间"} 或其带换行版本
-- 统计上一个自然月：访问次数、最近一次访问时间
-- 生成 results/<YYYY-MM>_summary.csv / .xlsx
-- 复制为 monthly/<YYYY-MM>.csv 并提交回仓库（需 GITHUB_TOKEN & contents:write 权限）
-- 通过飞书“自定义机器人 Webhook”发送卡片（摘要 + 按钮：打开CSV / 打开多维表格）
+Yilian 年报脚本（年度/全量）
+- 递归扫描仓库内 CSV（默认排除 results/、.github/ 等），合并去重
+- 兼容两种表头：{"项目名","基于哪条manifest分支","申请时间"} 及其“带换行”的版本
+- 支持 --year 参数（如 2025）；默认 ALL（分析 CSV 中的全部信息）
+- 生成:
+    results/<scope>_annual_summary.csv            # 按项目汇总
+    results/<scope>_annual_by_branch.csv          # 按项目-分支汇总
+    results/<scope>_annual_monthly.csv            # 月度分布（用于审视全年结构）
+    results/<scope>_annual_report.xlsx            # 上述三张表合并成一个 Excel
 
-环境变量（Actions 中设置）：
-- FEISHU_WEBHOOK_URL       必填，自定义机器人 Webhook URL
-- FEISHU_WEBHOOK_SECRET    选填，若机器人启用“签名校验”则必填
-- FEISHU_BITABLE_URL       选填，多维表格的查看链接（按钮用）
-- GITHUB_TOKEN             Actions 默认注入（需 workflow permissions: contents: write）
-- GITHUB_REPOSITORY        默认注入，形如 org/repo
-- GITHUB_REF_NAME          默认注入，当前分支；若无则脚本用 git 推断
+- 可选：若设置 FEISHU_WEBHOOK_URL，则发送一个简要卡片通知（不强依赖签名）
+- 可选：若存在 GITHUB_TOKEN，则自动 git 提交产物并 push（用于 Actions）
+
+环境变量：
+- FEISHU_WEBHOOK_URL    选填，飞书“自定义机器人”Webhook
+- FEISHU_WEBHOOK_SECRET 选填，若机器人启用签名校验
+- GITHUB_TOKEN          Actions 会默认注入；本地运行时可不设
 """
 
+from __future__ import annotations
+import argparse
+import base64
+import csv
+import datetime as dt
+import hashlib
+import hmac
+import json
 import os
 import re
-import json
-import glob
-import time
-import hmac
-import base64
-import hashlib
-import pathlib
 import subprocess
-from datetime import datetime, timedelta
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import requests
 
-# ----------------- 工具：时间与路径 ----------------- #
-def prev_month_range(now_local: datetime):
-    this_month_start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    prev_month_end = this_month_start - timedelta(seconds=1)
-    prev_month_start = prev_month_end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return prev_month_start, prev_month_end
+# -----------------------
+# 基本配置
+# -----------------------
+ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "gbk", "gb2312"]
+EXCLUDE_DIRS = {"results", ".github", ".git", ".venv", "venv", "__pycache__", ".idea", ".vscode"}
 
-def repo_root():
-    return pathlib.Path(__file__).resolve().parents[1]
+# 原始表头可能含换行，这里做标准化后的目标列名
+CANON_COLS = {
+    "项目名": ["项目名", "項目名", "项目", "项目名称", "項目名稱"],
+    "基于哪条manifest分支": [
+        "基于哪条manifest分支", "基于哪条manifest\n分支",
+        "manifest分支", "分支", "所用分支"
+    ],
+    "申请时间": ["申请时间", "申请\n时间", "申請時間", "时间", "时间戳"]
+}
 
-def ensure_dirs(*paths):
-    for p in paths:
-        pathlib.Path(p).mkdir(parents=True, exist_ok=True)
+DATE_FORMATS_HINT = [
+    "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+    "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+    "%Y年%m月%d日", "%Y年%m月%d日 %H:%M:%S"
+]
 
-# ----------------- 第1部分：汇总上月 CSV ----------------- #
-def find_csv_files(repo_dir: str, skip_dir: str = "results"):
-    csv_list = []
-    for root, dirs, files in os.walk(repo_dir):
-        if pathlib.Path(root).name == skip_dir:
+
+def find_repo_root(start: Path) -> Path:
+    p = start.resolve()
+    for _ in range(8):
+        if (p / ".git").exists():
+            return p
+        if p.parent == p:
+            break
+        p = p.parent
+    return start.resolve()
+
+
+def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    # 去除表头中的换行/空白
+    new_cols = []
+    for c in df.columns:
+        nc = str(c).replace("\n", "").replace("\r", "")
+        nc = re.sub(r"\s+", "", nc)
+        new_cols.append(nc)
+    df.columns = new_cols
+
+    # 字段对齐：把各种别名映射为标准名
+    mapping = {}
+    for std, aliases in CANON_COLS.items():
+        for col in df.columns:
+            if col in aliases:
+                mapping[col] = std
+    df = df.rename(columns=mapping)
+    return df
+
+
+def read_csv_any(path: Path) -> Optional[pd.DataFrame]:
+    for enc in ENCODINGS_TO_TRY:
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            df = normalize_headers(df)
+            return df
+        except Exception:
             continue
-        for f in files:
-            if f.lower().endswith(".csv"):
-                csv_list.append(os.path.join(root, f))
-    return csv_list
+    return None
 
-def load_and_concat(csv_paths):
-    frames = []
-    for path in csv_paths:
-        df = None
-        for enc in ("gbk", "utf-8", "utf-8-sig"):
+
+def pick_date_series(df: pd.DataFrame) -> Optional[pd.Series]:
+    if "申请时间" in df.columns:
+        return df["申请时间"]
+    # 兜底：尝试寻找最像日期的列
+    date_like = [c for c in df.columns if re.search(r"时间|date|日期|time", c, re.I)]
+    if date_like:
+        return df[date_like[0]]
+    return None
+
+
+def to_datetime_safe(series: pd.Series) -> pd.Series:
+    # 先试 pandas 自动解析
+    s = pd.to_datetime(series, errors="coerce", utc=False, infer_datetime_format=True)
+
+    # 再试手动常见格式
+    mask = s.isna()
+    if mask.any():
+        raw = series[mask].astype(str)
+        parsed = pd.Series([pd.NaT] * raw.shape[0], index=raw.index)
+        for fmt in DATE_FORMATS_HINT:
             try:
-                df = pd.read_csv(path, encoding=enc)
-                break
+                parsed2 = pd.to_datetime(raw, format=fmt, errors="coerce")
+                parsed = parsed.fillna(parsed2)
             except Exception:
-                continue
-        if df is None:
+                pass
+        s[mask] = parsed
+    return s
+
+
+def collect_csvs(repo_root: Path) -> List[Path]:
+    csvs: List[Path] = []
+    for p in repo_root.rglob("*.csv"):
+        parts = set(p.relative_to(repo_root).parts)
+        if parts & EXCLUDE_DIRS:
             continue
-        df.columns = [str(c).strip() for c in df.columns]
-        # 兼容“基于哪条manifest分支\n”
-        if {"项目名", "基于哪条manifest分支", "申请时间"}.issubset(df.columns):
-            frames.append(df[["项目名", "基于哪条manifest分支", "申请时间"]].copy())
-        elif {"项目名", "基于哪条manifest分支\n", "申请时间"}.issubset(df.columns):
-            part = df[["项目名", "基于哪条manifest分支\n", "申请时间"]].rename(
-                columns={"基于哪条manifest分支\n": "基于哪条manifest分支"}
-            )
-            frames.append(part.copy())
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        # 排除明显的产物/历史/缓存
+        if any(seg.startswith(".") for seg in parts):
+            continue
+        csvs.append(p)
+    return csvs
 
-def build_monthly_summary(df_all: pd.DataFrame, now_local: datetime):
-    prev_start, prev_end = prev_month_range(now_local)
-    month_str = prev_start.strftime("%Y-%m")
-    if df_all.empty:
-        out = pd.DataFrame(columns=["项目名", "基于哪条manifest分支", "访问次数", "最近一次访问时间"])
-        return out, month_str
 
-    df_all["申请时间"] = pd.to_datetime(df_all["申请时间"], errors="coerce")
-    m = (df_all["申请时间"] >= prev_start) & (df_all["申请时间"] <= prev_end)
-    recent_df = df_all[m]
+def unify_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    # 需要的列：项目名、分支、申请时间
+    # 若缺列，则补空列以便后续 groupby 不报错
+    for need in ["项目名", "基于哪条manifest分支"]:
+        if need not in df.columns:
+            df[need] = pd.NA
 
-    if recent_df.empty:
-        out = pd.DataFrame(columns=["项目名", "基于哪条manifest分支", "访问次数", "最近一次访问时间"])
-        return out, month_str
+    date_series = pick_date_series(df)
+    if date_series is None:
+        df["申请时间"] = pd.NaT
+    else:
+        df["申请时间"] = to_datetime_safe(date_series)
 
-    summary = (
-        recent_df.groupby(["项目名", "基于哪条manifest分支"])
-        .agg(访问次数=("申请时间", "count"), 最近一次访问时间=("申请时间", "max"))
-        .reset_index()
-        .sort_values(["项目名", "访问次数"], ascending=[True, False])
-    )
-    summary["最近一次访问时间"] = pd.to_datetime(summary["最近一次访问时间"], errors="coerce")
-    summary["最近一次访问时间"] = summary["最近一次访问时间"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
-    return summary, month_str
+    # 仅保留三列 + 原始全量（以备后续扩展）
+    keep = [c for c in df.columns if c in {"项目名", "基于哪条manifest分支", "申请时间"}]
+    df = df[keep].copy()
+    return df
 
-def save_outputs(summary: pd.DataFrame, month: str, out_dir: pathlib.Path):
-    ensure_dirs(out_dir)
-    csv_path = out_dir / f"{month}_summary.csv"
-    summary.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
-    # 尝试额外导出 Excel（可选）
+def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
+    # 去重依据：项目名-分支-时间 三元
+    return df.drop_duplicates(subset=["项目名", "基于哪条manifest分支", "申请时间"])
+
+
+def filter_scope(df: pd.DataFrame, scope: str) -> Tuple[pd.DataFrame, str]:
+    """
+    scope: "ALL" 或 "2025" 这样的年份
+    返回 (过滤后的 df, 实际用于文件名的 scope_str)
+    """
+    if scope.upper() == "ALL":
+        return df.copy(), "all"
     try:
-        from openpyxl import Workbook
-        from openpyxl.utils.dataframe import dataframe_to_rows
-        from openpyxl.utils import get_column_letter
-        from openpyxl.styles import Alignment, Font, PatternFill
-        from openpyxl.worksheet.table import Table, TableStyleInfo
+        year = int(scope)
+    except Exception:
+        # 无法解析年份就当 ALL
+        return df.copy(), "all"
+    mask = df["申请时间"].dt.year == year
+    return df[mask].copy(), str(year)
 
-        wb = Workbook(); ws = wb.active; ws.title = "Summary"
-        for row in dataframe_to_rows(summary, index=False, header=True):
-            ws.append(row)
 
-        ws.freeze_panes = "A2"
-        header_fill = PatternFill("solid", fgColor="DDDDDD")
-        for cell in ws[1]:
-            cell.font = Font(bold=True); cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+def group_summaries(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    # 1) 按项目汇总
+    by_proj = (
+        df.groupby("项目名", dropna=False)
+        .agg(
+            申请次数=("申请时间", "count"),
+            首次申请时间=("申请时间", "min"),
+            最近申请时间=("申请时间", "max"),
+            分支种类数=("基于哪条manifest分支", "nunique"),
+            最常用分支=("基于哪条manifest分支", lambda s: s.value_counts(dropna=True).idxmax() if s.dropna().shape[0] else pd.NA),
+        )
+        .sort_values(["申请次数", "最近申请时间"], ascending=[False, False])
+        .reset_index()
+    )
 
-        for col_idx, col_cells in enumerate(ws.columns, 1):
-            max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(10, max_len + 2), 60)
+    # 2) 按项目-分支汇总
+    by_proj_branch = (
+        df.groupby(["项目名", "基于哪条manifest分支"], dropna=False)
+        .agg(
+            次数=("申请时间", "count"),
+            首次时间=("申请时间", "min"),
+            最近时间=("申请时间", "max"),
+        )
+        .sort_values(["次数", "最近时间"], ascending=[False, False])
+        .reset_index()
+    )
 
-        tab = Table(displayName="SummaryTable", ref=ws.dimensions)
-        tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
-        xlsx_path = out_dir / f"{month}_summary.xlsx"
-        ws.add_table(tab); wb.save(xlsx_path)
-    except Exception as e:
-        print(f"[warn] Excel save skipped: {e}")
+    # 3) 月度分布（用于看全年分布结构）
+    month_col = df["申请时间"].dt.to_period("M").astype(str)
+    by_month = (
+        df.assign(月份=month_col)
+        .groupby("月份")
+        .size()
+        .rename("条目数")
+        .reset_index()
+        .sort_values("月份")
+    )
 
-    return str(csv_path)
+    return by_proj, by_proj_branch, by_month
 
-# ----------------- 第2部分：提交 monthly/<YYYY-MM>.csv ----------------- #
-def git_commit_and_push_monthly(csv_src: str, month: str):
-    repo = repo_root()
-    monthly_dir = repo / "monthly"
-    ensure_dirs(monthly_dir)
-    dst = monthly_dir / f"{month}.csv"
-    pathlib.Path(dst).write_bytes(pathlib.Path(csv_src).read_bytes())
 
-    def sh(cmd):
-        return subprocess.check_output(cmd, cwd=repo, text=True)
+def ensure_results_dir(repo_root: Path) -> Path:
+    out = repo_root / "results"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
-    # 配置 git 用户
-    subprocess.run(["git", "config", "user.name",  "github-actions[bot]"], cwd=repo, check=False)
-    subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], cwd=repo, check=False)
 
-    # 提交变更
-    subprocess.run(["git", "add", str(dst.relative_to(repo))], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-m", f"monthly: add {month}.csv [skip ci]"], cwd=repo, check=False)
-    subprocess.run(["git", "push"], cwd=repo, check=False)
+def save_outputs(out_dir: Path, scope_str: str,
+                 by_proj: pd.DataFrame,
+                 by_proj_branch: pd.DataFrame,
+                 by_month: pd.DataFrame) -> List[Path]:
+    csv1 = out_dir / f"{scope_str}_annual_summary.csv"
+    csv2 = out_dir / f"{scope_str}_annual_by_branch.csv"
+    csv3 = out_dir / f"{scope_str}_annual_monthly.csv"
+    xlsx = out_dir / f"{scope_str}_annual_report.xlsx"
 
-    # 生成原始下载链接
-    branch = os.environ.get("GITHUB_REF_NAME")
-    if not branch:
-        try:
-            branch = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
-        except Exception:
-            branch = "main"
-    repo_slug = os.environ.get("GITHUB_REPOSITORY", "")
-    csv_url = f"https://raw.githubusercontent.com/{repo_slug}/{branch}/monthly/{month}.csv"
-    return csv_url
+    by_proj.to_csv(csv1, index=False, encoding="utf-8-sig")
+    by_proj_branch.to_csv(csv2, index=False, encoding="utf-8-sig")
+    by_month.to_csv(csv3, index=False, encoding="utf-8-sig")
 
-# ----------------- 第3部分：Webhook 卡片 ----------------- #
-def sign_headers(secret: str):
+    with pd.ExcelWriter(xlsx, engine="openpyxl") as writer:
+        by_proj.to_excel(writer, index=False, sheet_name="按项目汇总")
+        by_proj_branch.to_excel(writer, index=False, sheet_name="按项目-分支")
+        by_month.to_excel(writer, index=False, sheet_name="月度分布")
+
+    return [csv1, csv2, csv3, xlsx]
+
+
+# -----------------------
+# 可选：飞书通知
+# -----------------------
+def feishu_sign(secret: str, timestamp: str) -> str:
+    # 飞书机器人签名（若启用），签名算法版本可能有差异；此实现覆盖 v2 常见用法
+    string_to_sign = f"{timestamp}\n{secret}".encode("utf-8")
+    h = hmac.new(string_to_sign, b"", digestmod=hashlib.sha256)
+    return base64.b64encode(h.digest()).decode("utf-8")
+
+
+def send_feishu_card(total_rows: int, proj_cnt: int, scope_str: str, files: List[Path]) -> None:
+    url = os.getenv("FEISHU_WEBHOOK_URL")
+    if not url:
+        print("[Feishu] FEISHU_WEBHOOK_URL 未设置，跳过发送。")
+        return
+    secret = os.getenv("FEISHU_WEBHOOK_SECRET")
     ts = str(int(time.time()))
-    string_to_sign = f"{ts}\n{secret}"
-    digest = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256).digest()
-    sign = base64.b64encode(digest).decode("utf-8")
-    return ts, sign
 
-def build_card_from_summary(df: pd.DataFrame, month: str, csv_url: str, bitable_url: str = ""):
-    total = len(df)
-    # Top 5：若有“访问次数”按其排序，否则取前5行
-    top = df.copy()
-    if "访问次数" in top.columns:
-        try:
-            top["访问次数"] = pd.to_numeric(top["访问次数"], errors="coerce").fillna(0).astype(int)
-        except Exception:
-            pass
-        top = top.sort_values("访问次数", ascending=False)
-    top_rows = top.head(5).to_dict("records")
+    file_lines = "\n".join([f"- {p.as_posix()}" for p in files])
 
-    # 组装 Markdown 列表
-    md_lines = []
-    for i, r in enumerate(top_rows, 1):
-        if "项目名" in r:
-            line = f"{i}. {r.get('项目名', '')}"
-            if "基于哪条manifest分支" in r and r.get("基于哪条manifest分支", ""):
-                line += f"（{r['基于哪条manifest分支']}）"
-            if "访问次数" in r and r.get("访问次数", "") != "":
-                line += f" · {r['访问次数']} 次"
-            md_lines.append(line)
-        elif "标题" in r:
-            # 兼容另一类数据：标题/链接/分类/发布时间
-            title = str(r.get("标题", ""))[:120]
-            link  = str(r.get("链接", ""))
-            md_lines.append(f"{i}. [{title}]({link})" if link.startswith("http") else f"{i}. {title}")
-    md = "\n".join(md_lines) if md_lines else "（无数据）"
-
-    actions = []
-    if csv_url:
-        actions.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "打开CSV"},
-            "type": "primary",
-            "url": csv_url
-        })
-    if bitable_url:
-        actions.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "打开多维表格"},
-            "url": bitable_url
-        })
-
-    card = {
-      "config": {"wide_screen_mode": True, "enable_forward": True},
-      "header": {"template": "blue", "title": {"tag": "plain_text", "content": f"Yilian 月报 · {month}"}},
-      "elements": [
-        {"tag": "div",
-         "fields": [
-            {"is_short": True, "text": {"tag": "lark_md", "content": f"**本月条数**\n{total}"}},
-            {"is_short": True, "text": {"tag": "lark_md", "content": f"**生成时间**\n{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}" }}
-         ]},
-        {"tag": "div", "text": {"tag": "lark_md", "content": f"**Top 5**\n{md}"}},
-      ] + ([{"tag": "action", "actions": actions}] if actions else [])
+    content = {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": f"Yilian 年度统计（{scope_str}）"}},
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md",
+                             "content": f"**合并总行数**：{total_rows}\n**项目数**：{proj_cnt}\n**产物**：\n{file_lines}"}
+                }
+            ]
+        }
     }
-    return card
 
-def send_webhook_card(card: dict, webhook: str, secret: str = ""):
-    body = {"msg_type": "interactive", "card": card}
+    payload = content
     if secret:
-        ts, sig = sign_headers(secret)
-        body.update({"timestamp": ts, "sign": sig})
-    r = requests.post(webhook, json=body, timeout=30)
-    r.raise_for_status()
-    return r.text
+        sign = feishu_sign(secret, ts)
+        payload.update({"timestamp": ts, "sign": sign})
 
-# ----------------- 主流程 ----------------- #
+    import urllib.request
+    req = urllib.request.Request(
+        url=url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print("[Feishu] 状态：", resp.status)
+    except Exception as e:
+        print("[Feishu] 发送失败：", e)
+
+
+# -----------------------
+# 可选：Git 提交
+# -----------------------
+def git_commit_and_push(repo_root: Path, message: str) -> None:
+    # 若在 Actions 内，GITHUB_TOKEN 已注入，'actions/checkout' 会配置好权限；本地无 token 也可提交到本地分支
+    def run(cmd: List[str]) -> None:
+        print("+", " ".join(cmd))
+        subprocess.check_call(cmd, cwd=str(repo_root))
+
+    try:
+        run(["git", "config", "user.name", "actions-user"])
+        run(["git", "config", "user.email", "actions@github.com"])
+        run(["git", "add", "results"])
+        run(["git", "commit", "-m", message])
+        run(["git", "push"])
+    except subprocess.CalledProcessError as e:
+        print("[Git] 提交/推送失败（可能无变更或本地环境缺失 git 凭据）：", e)
+
+
+# -----------------------
+# 主流程
+# -----------------------
 def main():
-    WEBHOOK = os.environ.get("FEISHU_WEBHOOK_URL")
-    assert WEBHOOK, "缺少 FEISHU_WEBHOOK_URL"
+    parser = argparse.ArgumentParser(description="Yilian 年度/全量统计")
+    parser.add_argument("--year", default="ALL",
+                        help="年份（如 2025），默认 ALL=不按年筛选、对 CSV 全量统计")
+    args = parser.parse_args()
 
-    SECRET  = os.environ.get("FEISHU_WEBHOOK_SECRET", "")
-    BITABLE_URL = os.environ.get("FEISHU_BITABLE_URL", "")
+    here = Path(__file__).resolve()
+    repo_root = find_repo_root(here)
+    results_dir = ensure_results_dir(repo_root)
 
-    root = repo_root()
-    results_dir = root / "results"
-    ensure_dirs(results_dir)
+    csv_paths = collect_csvs(repo_root)
+    if not csv_paths:
+        print("[Err] 未发现 CSV 数据。")
+        sys.exit(1)
 
-    # 1) 汇总
-    csv_files = find_csv_files(str(root), skip_dir="results")
-    df_all = load_and_concat(csv_files)
-    summary, month = build_monthly_summary(df_all, datetime.now())
-    csv_path = save_outputs(summary, month, results_dir)
+    frames = []
+    for p in csv_paths:
+        df = read_csv_any(p)
+        if df is None or df.empty:
+            print(f"[Skip] 无法读取或空文件: {p}")
+            continue
+        df = unify_dataframe(df)
+        frames.append(df)
 
-    # 2) 提交 monthly/ 并生成原始链接
-    csv_url = git_commit_and_push_monthly(csv_path, month)
+    if not frames:
+        print("[Err] 无有效数据。")
+        sys.exit(2)
 
-    # 3) 通过 Webhook 发卡片
-    card = build_card_from_summary(summary, month, csv_url, BITABLE_URL)
-    resp = send_webhook_card(card, WEBHOOK, SECRET)
-    print("Webhook OK:", resp)
+    merged = pd.concat(frames, ignore_index=True)
+    merged = deduplicate(merged)
+    # 清掉没有时间戳的行（按需保留也可以，这里默认丢弃）
+    merged = merged[merged["申请时间"].notna()].copy()
+
+    scoped, scope_str = filter_scope(merged, args.year)
+    if scoped.empty:
+        print(f"[Warn] 在范围 {args.year} 内没有数据。输出空表。")
+        # 仍然输出空产物以便流程完整
+        by_proj = pd.DataFrame(columns=["项目名","申请次数","首次申请时间","最近申请时间","分支种类数","最常用分支"])
+        by_pb = pd.DataFrame(columns=["项目名","基于哪条manifest分支","次数","首次时间","最近时间"])
+        by_month = pd.DataFrame(columns=["月份","条目数"])
+    else:
+        by_proj, by_pb, by_month = group_summaries(scoped)
+
+    files = save_outputs(results_dir, scope_str, by_proj, by_pb, by_month)
+
+    # 飞书通知（可选）
+    total_rows = int(merged.shape[0])
+    proj_cnt = int(scoped["项目名"].nunique(dropna=True)) if not scoped.empty else 0
+    send_feishu_card(total_rows, proj_cnt, scope_str, files)
+
+    # Git 提交（可选）
+    git_commit_and_push(repo_root, f"chore: Yilian 年度统计产物（{scope_str}）")
+
+    print("[Done] OK.")
+
 
 if __name__ == "__main__":
     main()
