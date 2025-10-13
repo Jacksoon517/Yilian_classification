@@ -1,15 +1,21 @@
-name: yilian-monthly
+name: Yilian Annual Report
 
 on:
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "统计年份（如 2025）。留空或填 ALL 代表全量"
+        required: false
+        default: "ALL"
   schedule:
-    - cron: '0 2 1 * *'    # 每月1日 02:00 UTC（北京 10:00）
-  workflow_dispatch: {}
+    # 每年 1 月 1 日 03:00（UTC）跑上一年年报；如需固定跑“本年”，把脚本参数改为 ALL
+    - cron: '0 3 1 1 *'
 
 permissions:
-  contents: write          # 允许提交 monthly/YYYY-MM.csv
+  contents: write
 
 jobs:
-  monthly:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -22,12 +28,13 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install -U pandas requests python-dateutil openpyxl
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl
 
-      - name: Run monthly pipeline (summary + commit + webhook)
+      - name: Run annual aggregation
         env:
-          FEISHU_WEBHOOK_URL:    ${{ secrets.FEISHU_WEBHOOK_URL }}
-          FEISHU_BITABLE_URL:    ${{ secrets.FEISHU_BITABLE_URL }}    # 可选，按钮直达表格
-          GITHUB_TOKEN:          ${{ secrets.GITHUB_TOKEN }}          # Actions 自动注入，也可不显式传
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/yilian_monthly_webhook.py
+          python scripts/annual_runner.py --year "${{ github.event.inputs.year || 'ALL' }}"
